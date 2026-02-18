@@ -12,8 +12,8 @@ import (
 	"syscall"
 	"time"
 
-	"goastdb/pkg/astdb"
-	"goastdb/pkg/astdb/governance"
+	"github.com/Yacobolo/goastdb/pkg/astdb"
+	"github.com/Yacobolo/goastdb/pkg/astdb/governance"
 )
 
 type outputEnvelope struct {

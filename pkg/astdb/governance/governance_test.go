@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"goastdb/pkg/astdb"
+	"github.com/Yacobolo/goastdb/pkg/astdb"
 )
 
 func TestValidateRule_InvalidSeverity(t *testing.T) {

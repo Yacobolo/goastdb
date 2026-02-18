@@ -1,4 +1,4 @@
-module goastdb
+module github.com/Yacobolo/goastdb
 
 go 1.25.7
 
