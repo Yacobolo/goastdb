@@ -114,7 +114,7 @@ The JSON envelope includes:
 ## CI and releases
 
 - CI: `.github/workflows/ci.yml` runs `go test ./...` on push/PR.
-- Releases: `.github/workflows/release.yml` builds cross-platform binaries on `v*` tags and publishes GitHub release artifacts with checksums.
+- Releases: `.github/workflows/release.yml` builds native binaries on `v*` tags (`linux/amd64`, `darwin/arm64`, `windows/amd64`) and publishes artifacts with checksums.
 
 Create a release by pushing a tag:
 
