@@ -7,64 +7,125 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/signal"
+	"path/filepath"
 	"strings"
-	"syscall"
-	"time"
 
 	"github.com/Yacobolo/goastdb/pkg/astdb"
+	"github.com/Yacobolo/goastdb/pkg/astdb/explore"
 	"github.com/Yacobolo/goastdb/pkg/astdb/governance"
 )
 
+type queryRun struct {
+	Name string           `json:"name"`
+	SQL  string           `json:"sql"`
+	Rows []governance.Row `json:"rows,omitempty"`
+}
+
 type outputEnvelope struct {
-	Result     astdb.Result           `json:"result"`
-	AdhocRows  []governance.Row       `json:"adhoc_rows,omitempty"`
-	Violations []governance.Violation `json:"violations,omitempty"`
-	Rules      []governance.Rule      `json:"rules,omitempty"`
+	Result        astdb.Result    `json:"result"`
+	Runs          []queryRun      `json:"runs,omitempty"`
+	HelperQueries []explore.Query `json:"helper_queries,omitempty"`
 }
 
 func main() {
-	defaults := astdb.DefaultOptions()
-
-	opts := astdb.Options{}
-	var adhocSQL string
-	var outputFormat string
-	var governanceRun bool
-	var governanceList bool
-	var ruleIDsCSV string
-	var timeout time.Duration
-	flag.StringVar(&opts.RepoRoot, "repo", defaults.RepoRoot, "repository root to scan")
-	flag.StringVar(&opts.Subdir, "subdir", defaults.Subdir, "optional subdirectory under repo root")
-	flag.IntVar(&opts.MaxFiles, "max-files", defaults.MaxFiles, "optional cap for number of .go files (0 = all)")
-	flag.IntVar(&opts.Workers, "workers", defaults.Workers, "parser worker count")
-	flag.StringVar(&opts.DuckDBPath, "duckdb", defaults.DuckDBPath, "duckdb output path")
-	flag.StringVar(&opts.Mode, "mode", defaults.Mode, "run mode: build|query|both")
-	flag.BoolVar(&opts.Reuse, "reuse", defaults.Reuse, "reuse existing DB when fingerprint matches")
-	flag.BoolVar(&opts.ForceRebuild, "force-rebuild", defaults.ForceRebuild, "force full rebuild")
-	flag.BoolVar(&opts.QueryBench, "query-bench", defaults.QueryBench, "run built-in query benchmarks")
-	flag.IntVar(&opts.QueryWarmup, "query-warmup", defaults.QueryWarmup, "warmup runs per query")
-	flag.IntVar(&opts.QueryIters, "query-iters", defaults.QueryIters, "measured iterations per query")
-	flag.BoolVar(&opts.KeepOutputFiles, "keep", defaults.KeepOutputFiles, "keep output DB file")
-	flag.StringVar(&adhocSQL, "adhoc", "", "optional ad hoc SQL query to run after indexing")
-	flag.BoolVar(&governanceRun, "governance", false, "run enabled governance rules")
-	flag.BoolVar(&governanceList, "list-rules", false, "list governance rules")
-	flag.StringVar(&ruleIDsCSV, "rules", "", "comma-separated rule IDs to run (default: all enabled)")
-	flag.DurationVar(&timeout, "timeout", 0, "optional run timeout (e.g. 30s, 2m)")
-	flag.StringVar(&outputFormat, "format", "text", "output format: text|json")
-	flag.Parse()
-
-	if outputFormat != "text" && outputFormat != "json" {
-		log.Fatalf("invalid -format %q (expected text or json)", outputFormat)
+	if len(os.Args) < 2 {
+		printRootUsage()
+		os.Exit(2)
 	}
 
+	switch os.Args[1] {
+	case "query":
+		runQueryCommand(os.Args[2:])
+	case "helper":
+		runHelperCommand(os.Args[2:])
+	case "-h", "--help", "help":
+		printRootUsage()
+	default:
+		log.Fatalf("unknown command %q\n\n%s", os.Args[1], rootUsageText())
+	}
+}
+
+func runQueryCommand(args []string) {
+	fs := flag.NewFlagSet("query", flag.ExitOnError)
+
+	repo := fs.String("repo", ".", "repository root to scan")
+	duckdbPath := fs.String("duckdb", "", "duckdb output path (default <repo>/.goast/ast.db)")
+	format := fs.String("format", "text", "output format: text|json")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: goastdb query [flags] <sql> [<sql>...]")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "Executes one or more raw SQL queries against the AST database.")
+		fmt.Fprintln(os.Stderr, "")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		log.Fatal(err)
+	}
+
+	sqlQueries := fs.Args()
+	if len(sqlQueries) == 0 {
+		fs.Usage()
+		os.Exit(2)
+	}
+
+	result, runs := executeQueries(*repo, resolveDuckDBPath(*repo, *duckdbPath), sqlQueries)
+	printOutput(*format, outputEnvelope{Result: result, Runs: runs})
+}
+
+func runHelperCommand(args []string) {
+	fs := flag.NewFlagSet("helper", flag.ExitOnError)
+
+	repo := fs.String("repo", ".", "repository root to scan")
+	duckdbPath := fs.String("duckdb", "", "duckdb output path (default <repo>/.goast/ast.db)")
+	format := fs.String("format", "text", "output format: text|json")
+	fs.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: goastdb helper [flags] list")
+		fmt.Fprintln(os.Stderr, "       goastdb helper [flags] <id[,id...]> [<id>...]")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "Lists or executes built-in helper SQL queries.")
+		fmt.Fprintln(os.Stderr, "")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		log.Fatal(err)
+	}
+
+	ids := parseIDs(fs.Args())
+	if len(ids) == 0 || (len(ids) == 1 && ids[0] == "list") {
+		printHelperList(*format, explore.DefaultQueries())
+		return
+	}
+
+	helperQueries, err := explore.SelectQueries(ids)
+	if err != nil {
+		log.Fatal(err)
+	}
+	sqlQueries := make([]string, 0, len(helperQueries))
+	names := make([]string, 0, len(helperQueries))
+	for _, q := range helperQueries {
+		sqlQueries = append(sqlQueries, q.SQL)
+		names = append(names, q.ID)
+	}
+
+	result, runs := executeNamedQueries(*repo, resolveDuckDBPath(*repo, *duckdbPath), names, sqlQueries)
+	printOutput(*format, outputEnvelope{Result: result, Runs: runs, HelperQueries: helperQueries})
+}
+
+func executeQueries(repo, duckdbPath string, sqlQueries []string) (astdb.Result, []queryRun) {
+	names := make([]string, 0, len(sqlQueries))
+	for i := range sqlQueries {
+		names = append(names, fmt.Sprintf("raw_%d", i+1))
+	}
+	return executeNamedQueries(repo, duckdbPath, names, sqlQueries)
+}
+
+func executeNamedQueries(repo, duckdbPath string, names, sqlQueries []string) (astdb.Result, []queryRun) {
 	ctx := context.Background()
-	if timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
-	}
-	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	opts := astdb.DefaultOptions()
+	opts.RepoRoot = repo
+	opts.DuckDBPath = duckdbPath
+	opts.Mode = "query"
+	opts.QueryBench = false
 
 	result, err := astdb.Run(ctx, opts)
 	if err != nil {
@@ -72,104 +133,118 @@ func main() {
 	}
 
 	runner := governance.NewRunner(opts.DuckDBPath)
-	rules := make([]governance.Rule, 0)
-	if governanceList || governanceRun {
-		rules, err = runner.ListRules(ctx)
+	runs := make([]queryRun, 0, len(sqlQueries))
+	for i, sqlQuery := range sqlQueries {
+		rows, err := runner.AdhocQuery(ctx, sqlQuery)
 		if err != nil {
-			log.Fatal(err)
+			log.Fatalf("query %s failed: %v", names[i], err)
 		}
+		runs = append(runs, queryRun{Name: names[i], SQL: sqlQuery, Rows: rows})
 	}
+	return result, runs
+}
 
-	violations := make([]governance.Violation, 0)
-	if governanceRun {
-		ruleIDs := parseRuleIDs(ruleIDsCSV)
-		violations, err = runner.Run(ctx, governance.RunOptions{RuleIDs: ruleIDs})
-		if err != nil {
-			log.Fatal(err)
-		}
-	}
-
-	adhocRows := make([]governance.Row, 0)
-	if adhocSQL != "" {
-		adhocRows, err = runner.AdhocQuery(ctx, adhocSQL)
-		if err != nil {
-			log.Fatal(err)
-		}
-	}
-
-	if outputFormat == "json" {
-		env := outputEnvelope{Result: result, AdhocRows: adhocRows, Violations: violations, Rules: rules}
+func printHelperList(format string, queries []explore.Query) {
+	if format == "json" {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		if err := enc.Encode(env); err != nil {
+		if err := enc.Encode(struct {
+			HelperQueries []explore.Query `json:"helper_queries"`
+		}{HelperQueries: queries}); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	fmt.Printf("helper queries: total=%d\n", len(queries))
+	for _, q := range queries {
+		fmt.Printf("helper=%s desc=%q\n", q.ID, q.Description)
+	}
+}
+
+func printOutput(format string, out outputEnvelope) {
+	if format != "text" && format != "json" {
+		log.Fatalf("invalid -format %q (expected text or json)", format)
+	}
+
+	if format == "json" {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(out); err != nil {
 			log.Fatal(err)
 		}
 		return
 	}
 
-	fmt.Printf("scan: files=%d subdir=%q max_files=%d scan_ms=%d\n", result.ScanFiles, result.Subdir, result.MaxFiles, result.ScanElapsed.Milliseconds())
+	res := out.Result
+	fmt.Printf("scan: files=%d subdir=%q max_files=%d scan_ms=%d\n", res.ScanFiles, res.Subdir, res.MaxFiles, res.ScanElapsed.Milliseconds())
 	fmt.Printf("build: action=%s reason=%q changed=%d parse_errors=%d parse_ms=%d load_ms=%d\n",
-		result.Sync.Action,
-		result.Sync.Reason,
-		result.Sync.Changed,
-		result.Sync.ParseErrors,
-		result.Sync.ParseElapsed.Milliseconds(),
-		result.Sync.LoadElapsed.Milliseconds(),
+		res.Sync.Action,
+		res.Sync.Reason,
+		res.Sync.Changed,
+		res.Sync.ParseErrors,
+		res.Sync.ParseElapsed.Milliseconds(),
+		res.Sync.LoadElapsed.Milliseconds(),
 	)
-	fmt.Printf("db: files=%d nodes=%d\n", result.Sync.FilesCount, result.Sync.NodesCount)
+	fmt.Printf("db: files=%d nodes=%d\n", res.Sync.FilesCount, res.Sync.NodesCount)
 
-	if len(result.QueryResults) > 0 {
-		fmt.Printf("queries: warmup=%d iters=%d\n", result.QueryWarmup, result.QueryIters)
-		for i, q := range result.QueryResults {
-			avgMS := float64(q.Elapsed.Milliseconds()) / float64(result.QueryIters)
-			fmt.Printf("query[%d] %s: total_ms=%d avg_ms=%.3f\n", i+1, q.Name, q.Elapsed.Milliseconds(), avgMS)
+	if len(out.Runs) > 0 {
+		fmt.Printf("sql runs=%d\n", len(out.Runs))
+		for _, run := range out.Runs {
+			fmt.Printf("run=%s rows=%d\n", run.Name, len(run.Rows))
+			for i, row := range run.Rows {
+				fmt.Printf("run=%s row[%d]=%v\n", run.Name, i+1, row)
+			}
 		}
-	}
-
-	if governanceList {
-		fmt.Printf("rules: total=%d\n", len(rules))
-		for _, rule := range rules {
-			fmt.Printf("rule=%s enabled=%t severity=%s category=%s desc=%q\n", rule.ID, rule.Enabled, rule.Severity, rule.Category, rule.Description)
-		}
-	}
-
-	if governanceRun {
-		fmt.Printf("governance violations=%d\n", len(violations))
-		for i, v := range violations {
-			fmt.Printf("violation[%d] rule=%s severity=%s file=%s line=%d detail=%q\n", i+1, v.RuleID, v.Severity, v.FilePath, v.Line, v.Detail)
-		}
-	}
-
-	if len(adhocRows) > 0 {
-		fmt.Printf("adhoc rows=%d\n", len(adhocRows))
-		for i, row := range adhocRows {
-			fmt.Printf("row[%d]=%v\n", i+1, row)
-		}
-	} else if adhocSQL != "" {
-		fmt.Println("adhoc rows=0")
 	}
 }
 
-func parseRuleIDs(csv string) []string {
-	if strings.TrimSpace(csv) == "" {
-		return nil
-	}
-	parts := strings.Split(csv, ",")
-	out := make([]string, 0, len(parts))
-	seen := make(map[string]struct{}, len(parts))
-	for _, p := range parts {
-		id := strings.TrimSpace(p)
-		if id == "" {
-			continue
+func parseIDs(args []string) []string {
+	out := make([]string, 0, len(args))
+	seen := make(map[string]struct{}, len(args))
+	for _, arg := range args {
+		parts := strings.Split(arg, ",")
+		for _, part := range parts {
+			id := strings.TrimSpace(part)
+			if id == "" {
+				continue
+			}
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, id)
 		}
-		if _, ok := seen[id]; ok {
-			continue
-		}
-		seen[id] = struct{}{}
-		out = append(out, id)
-	}
-	if len(out) == 0 {
-		return nil
 	}
 	return out
+}
+
+func resolveDuckDBPath(repoRoot, duckdbPath string) string {
+	if strings.TrimSpace(duckdbPath) != "" {
+		return duckdbPath
+	}
+	return filepath.Join(repoRoot, ".goast", "ast.db")
+}
+
+func rootUsageText() string {
+	return strings.TrimSpace(`goastdb indexes Go AST into DuckDB and executes SQL.
+
+Usage:
+  goastdb query [flags] <sql> [<sql>...]
+  goastdb helper [flags] list
+  goastdb helper [flags] <id[,id...]> [<id>...]
+
+Examples:
+  goastdb query "SELECT COUNT(*) AS files FROM files"
+  goastdb query "SELECT COUNT(*) AS files FROM files" "SELECT COUNT(*) AS nodes FROM nodes"
+  goastdb helper list
+  goastdb helper AST_KIND_DISTRIBUTION,FUNCTIONS_PER_FILE
+
+Defaults:
+  --repo defaults to current directory
+  --duckdb defaults to <repo>/.goast/ast.db
+`)
+}
+
+func printRootUsage() {
+	fmt.Println(rootUsageText())
 }

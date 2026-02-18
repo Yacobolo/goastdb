@@ -43,7 +43,7 @@ func DefaultOptions() Options {
 	return Options{
 		RepoRoot:        ".",
 		Workers:         runtime.NumCPU(),
-		DuckDBPath:      "./.tmp/goastdb/ast.duckdb",
+		DuckDBPath:      "./.goast/ast.db",
 		Mode:            "both",
 		Reuse:           true,
 		QueryBench:      true,
@@ -258,7 +258,7 @@ func normalizeAndValidateOptions(opts *Options) error {
 		opts.RepoRoot = "."
 	}
 	if strings.TrimSpace(opts.DuckDBPath) == "" {
-		opts.DuckDBPath = "./.tmp/goastdb/ast.duckdb"
+		opts.DuckDBPath = "./.goast/ast.db"
 	}
 	if opts.Workers <= 0 {
 		opts.Workers = 1

@@ -1,124 +1,93 @@
 # goastdb
 
-`goastdb` indexes Go AST into DuckDB so you can run SQL-based architecture and governance checks at repository scale.
+`goastdb` indexes Go AST into DuckDB and lets you run SQL directly against your codebase.
 
-It is designed for two workflows:
-
-1. Fast local iteration on code-smell and architecture queries.
-2. Repeatable CI governance with machine-readable output.
-
-## What it does
-
-- Parses Go source with `go/ast` and writes node-level facts into DuckDB.
-- Stores parent/child relationships and source locations for joins across files and symbols.
-- Reuses an existing database when source fingerprint is unchanged.
-- Runs benchmark queries in one process to amortize DB session overhead.
-- Runs governance checks from SQL stored in `governance_rules`.
+It is optimized for day-to-day exploration: from repo root, defaults work without extra flags.
 
 ## Install
 
-### Build from source
-
 ```bash
-git clone <your-repo-url>
-cd goastdb
-go build -o bin/goastdb ./cmd/goastdb
+go install github.com/Yacobolo/goastdb/cmd/goastdb@latest
 ```
 
-### Run without installing
+## Defaults
+
+- Repo root: current directory (`.`)
+- DB path: `<repo>/.goast/ast.db`
+- Mode: query-first workflow (reuses DB, rebuilds when source changed)
+
+## Commands
+
+### Query
+
+Run one or more raw SQL queries.
 
 ```bash
-go run ./cmd/goastdb -repo .
+# single query
+goastdb query "SELECT COUNT(*) AS files FROM files"
+
+# multiple queries in one run
+goastdb query \
+  "SELECT COUNT(*) AS files FROM files" \
+  "SELECT COUNT(*) AS nodes FROM nodes"
 ```
 
-## Quick start
+### Helper
+
+List or run built-in helper queries.
 
 ```bash
-# Build/reuse index and run built-in query benchmark
-go run ./cmd/goastdb -repo . -duckdb ./.tmp/goastdb/ast.duckdb -mode both -reuse
+# list helper query IDs
+goastdb helper list
 
-# Build index only
-go run ./cmd/goastdb -repo . -mode build -query-bench=false
-
-# Query benchmark only (rebuilds if fingerprint changed)
-go run ./cmd/goastdb -repo . -mode query
+# run selected helper queries
+goastdb helper AST_KIND_DISTRIBUTION,FUNCTIONS_PER_FILE
 ```
 
-## Governance workflow
+Helper IDs (overview + Go best-practice heuristics):
+
+- `AST_KIND_DISTRIBUTION`
+- `PACKAGE_FILE_COUNTS`
+- `FILES_BY_NODE_COUNT`
+- `FUNCTIONS_PER_FILE`
+- `LARGE_FUNCTIONS_BY_LINES`
+- `COMPLEX_FUNCTIONS_BY_BRANCHING`
+- `SIGNATURES_WITH_MANY_FIELDS`
+- `LARGE_STRUCT_TYPES`
+- `LARGE_INTERFACES`
+- `IMPORT_FREQUENCIES`
+- `THIRD_PARTY_IMPORTS`
+- `TOP_IDENTIFIERS`
+- `BLANK_IDENTIFIER_USAGE`
+- `PANIC_USAGE`
+- `GO_ROUTINE_SPAWNS`
+- `DEFER_HEAVY_FUNCTIONS`
+- `INIT_FUNCTIONS`
+- `TEST_FILE_NODE_DENSITY`
+- `LITERAL_HEAVY_FILES`
+- `PARSE_ERRORS`
+
+## Shared flags
+
+Both `query` and `helper` support:
+
+- `--repo` repository root (default `.`)
+- `--duckdb` DB path (default `<repo>/.goast/ast.db`)
+- `--format` output format: `text|json`
+
+## JSON output
 
 ```bash
-# List known rules (default rules are bootstrapped automatically)
-go run ./cmd/goastdb -repo . -list-rules
-
-# Run all enabled rules
-go run ./cmd/goastdb -repo . -governance
-
-# Run only selected rules
-go run ./cmd/goastdb -repo . -governance -rules RULE_A,RULE_B
+goastdb query --format json "SELECT COUNT(*) AS n FROM nodes"
 ```
-
-Rule severity must be one of: `critical`, `error`, `warning`, `info`.
-
-## Ad hoc SQL
-
-```bash
-go run ./cmd/goastdb -repo . -mode build -reuse \
-  -adhoc "SELECT kind, COUNT(*) AS n FROM nodes GROUP BY kind ORDER BY n DESC LIMIT 20"
-```
-
-## JSON output for CI
-
-Use `-format json` for stable integration output.
-
-```bash
-go run ./cmd/goastdb -repo . -governance -format json
-```
-
-The JSON envelope includes:
-
-- `result`: scan/build/query metrics
-- `rules`: rule metadata (when using `-list-rules` or `-governance`)
-- `violations`: governance results (when using `-governance`)
-- `adhoc_rows`: result rows (when using `-adhoc`)
-
-## Important flags
-
-- `-repo`: repository root to scan
-- `-subdir`: optional subdirectory under repo
-- `-duckdb`: output DB path (default `./.tmp/goastdb/ast.duckdb`)
-- `-mode`: `build | query | both`
-- `-reuse`: reuse DB when fingerprint matches
-- `-force-rebuild`: force full rebuild
-- `-workers`: parse worker count
-- `-max-files`: optional cap for `.go` files (`0` means all)
-- `-query-bench`: run benchmark queries
-- `-query-warmup`: warmup runs per benchmark query
-- `-query-iters`: measured iterations per benchmark query
-- `-timeout`: optional timeout (for example `2m`)
-- `-format`: `text | json`
 
 ## Data model
 
 - `files(file_id, path, pkg_name, parse_error, bytes)`
 - `nodes(file_id, ordinal, parent_ordinal, kind, node_text, pos, end, start_line, start_col, end_line, end_col, start_offset, end_offset)`
 - `run_meta(key, value)`
-- `governance_rules(rule_id, category, severity, description, query_sql, enabled, updated_unix)`
 
-## Production use notes
+## Operational notes
 
-- Use one process per DB path to avoid DuckDB file lock conflicts.
-- Keep DB files out of source control (`.tmp/` and `*.duckdb` are ignored).
-- Prefer a persistent DB path in CI workers to maximize reuse.
-- For very large repositories, set `-timeout` and tune `-workers`.
-
-## CI and releases
-
-- CI: `.github/workflows/ci.yml` runs `go test ./...` on push/PR.
-- Releases: `.github/workflows/release.yml` builds native binaries on `v*` tags (`linux/amd64`, `darwin/arm64`, `windows/amd64`) and publishes artifacts with checksums.
-
-Create a release by pushing a tag:
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
+- Use one process per DB path to avoid DuckDB lock conflicts.
+- `.goast/` and DB files should be gitignored.
