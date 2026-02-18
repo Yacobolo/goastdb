@@ -20,16 +20,12 @@ go install github.com/Yacobolo/goastdb/cmd/goastdb@latest
 
 ### Query
 
-Run one or more raw SQL queries.
+Run one raw SQL query.
 
 ```bash
 # single query
 goastdb query "SELECT COUNT(*) AS files FROM files"
 
-# multiple queries in one run
-goastdb query \
-  "SELECT COUNT(*) AS files FROM files" \
-  "SELECT COUNT(*) AS nodes FROM nodes"
 ```
 
 ### Helper
@@ -40,8 +36,8 @@ List or run built-in helper queries.
 # list helper query IDs
 goastdb helper list
 
-# run selected helper queries
-goastdb helper AST_KIND_DISTRIBUTION,FUNCTIONS_PER_FILE
+# run one helper query by ID
+goastdb helper AST_KIND_DISTRIBUTION
 ```
 
 Helper IDs (overview + Go best-practice heuristics):
@@ -74,6 +70,8 @@ Both `query` and `helper` support:
 - `--repo` repository root (default `.`)
 - `--duckdb` DB path (default `<repo>/.goast/ast.db`)
 - `--format` output format: `text|json`
+
+In `text` format, results are printed as a DuckDB-style ASCII table plus row count.
 
 ## JSON output
 

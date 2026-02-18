@@ -9,22 +9,18 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Yacobolo/goastdb/pkg/astdb"
 	"github.com/Yacobolo/goastdb/pkg/astdb/explore"
 	"github.com/Yacobolo/goastdb/pkg/astdb/governance"
 )
 
-type queryRun struct {
-	Name string           `json:"name"`
-	SQL  string           `json:"sql"`
-	Rows []governance.Row `json:"rows,omitempty"`
-}
-
 type outputEnvelope struct {
-	Result        astdb.Result    `json:"result"`
-	Runs          []queryRun      `json:"runs,omitempty"`
-	HelperQueries []explore.Query `json:"helper_queries,omitempty"`
+	Result astdb.Result     `json:"result"`
+	Table  governance.Table `json:"table"`
+	Helper *explore.Query   `json:"helper,omitempty"`
+	Mode   string           `json:"mode"`
 }
 
 func main() {
@@ -47,79 +43,67 @@ func main() {
 
 func runQueryCommand(args []string) {
 	fs := flag.NewFlagSet("query", flag.ExitOnError)
-
 	repo := fs.String("repo", ".", "repository root to scan")
 	duckdbPath := fs.String("duckdb", "", "duckdb output path (default <repo>/.goast/ast.db)")
 	format := fs.String("format", "text", "output format: text|json")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: goastdb query [flags] <sql> [<sql>...]")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Executes one or more raw SQL queries against the AST database.")
-		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "Usage: goastdb query [flags] <sql>")
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, "Executes one SQL query against the AST database.")
+		fmt.Fprintln(os.Stderr)
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
 		log.Fatal(err)
 	}
-
-	sqlQueries := fs.Args()
-	if len(sqlQueries) == 0 {
+	if len(fs.Args()) != 1 {
 		fs.Usage()
 		os.Exit(2)
 	}
 
-	result, runs := executeQueries(*repo, resolveDuckDBPath(*repo, *duckdbPath), sqlQueries)
-	printOutput(*format, outputEnvelope{Result: result, Runs: runs})
+	sqlQuery := fs.Args()[0]
+	result, table := executeQuery(*repo, resolveDuckDBPath(*repo, *duckdbPath), sqlQuery)
+	printQueryOutput(*format, outputEnvelope{Mode: "query", Result: result, Table: table})
 }
 
 func runHelperCommand(args []string) {
 	fs := flag.NewFlagSet("helper", flag.ExitOnError)
-
 	repo := fs.String("repo", ".", "repository root to scan")
 	duckdbPath := fs.String("duckdb", "", "duckdb output path (default <repo>/.goast/ast.db)")
 	format := fs.String("format", "text", "output format: text|json")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, "Usage: goastdb helper [flags] list")
-		fmt.Fprintln(os.Stderr, "       goastdb helper [flags] <id[,id...]> [<id>...]")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Lists or executes built-in helper SQL queries.")
-		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "       goastdb helper [flags] <id>")
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, "Lists helper queries or executes one helper query by ID.")
+		fmt.Fprintln(os.Stderr)
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
 		log.Fatal(err)
 	}
 
-	ids := parseIDs(fs.Args())
-	if len(ids) == 0 || (len(ids) == 1 && ids[0] == "list") {
+	if len(fs.Args()) == 0 || fs.Args()[0] == "list" {
 		printHelperList(*format, explore.DefaultQueries())
 		return
 	}
+	if len(fs.Args()) != 1 {
+		fs.Usage()
+		os.Exit(2)
+	}
 
-	helperQueries, err := explore.SelectQueries(ids)
+	helperID := strings.TrimSpace(fs.Args()[0])
+	helpers, err := explore.SelectQueries([]string{helperID})
 	if err != nil {
 		log.Fatal(err)
 	}
-	sqlQueries := make([]string, 0, len(helperQueries))
-	names := make([]string, 0, len(helperQueries))
-	for _, q := range helperQueries {
-		sqlQueries = append(sqlQueries, q.SQL)
-		names = append(names, q.ID)
-	}
+	helper := helpers[0]
 
-	result, runs := executeNamedQueries(*repo, resolveDuckDBPath(*repo, *duckdbPath), names, sqlQueries)
-	printOutput(*format, outputEnvelope{Result: result, Runs: runs, HelperQueries: helperQueries})
+	result, table := executeQuery(*repo, resolveDuckDBPath(*repo, *duckdbPath), helper.SQL)
+	printQueryOutput(*format, outputEnvelope{Mode: "helper", Result: result, Table: table, Helper: &helper})
 }
 
-func executeQueries(repo, duckdbPath string, sqlQueries []string) (astdb.Result, []queryRun) {
-	names := make([]string, 0, len(sqlQueries))
-	for i := range sqlQueries {
-		names = append(names, fmt.Sprintf("raw_%d", i+1))
-	}
-	return executeNamedQueries(repo, duckdbPath, names, sqlQueries)
-}
-
-func executeNamedQueries(repo, duckdbPath string, names, sqlQueries []string) (astdb.Result, []queryRun) {
+func executeQuery(repo, duckdbPath, sqlQuery string) (astdb.Result, governance.Table) {
 	ctx := context.Background()
 	opts := astdb.DefaultOptions()
 	opts.RepoRoot = repo
@@ -133,15 +117,11 @@ func executeNamedQueries(repo, duckdbPath string, names, sqlQueries []string) (a
 	}
 
 	runner := governance.NewRunner(opts.DuckDBPath)
-	runs := make([]queryRun, 0, len(sqlQueries))
-	for i, sqlQuery := range sqlQueries {
-		rows, err := runner.AdhocQuery(ctx, sqlQuery)
-		if err != nil {
-			log.Fatalf("query %s failed: %v", names[i], err)
-		}
-		runs = append(runs, queryRun{Name: names[i], SQL: sqlQuery, Rows: rows})
+	table, err := runner.QueryTable(ctx, sqlQuery)
+	if err != nil {
+		log.Fatal(err)
 	}
-	return result, runs
+	return result, table
 }
 
 func printHelperList(format string, queries []explore.Query) {
@@ -155,17 +135,20 @@ func printHelperList(format string, queries []explore.Query) {
 		}
 		return
 	}
-	fmt.Printf("helper queries: total=%d\n", len(queries))
+
+	rows := make([][]any, 0, len(queries))
 	for _, q := range queries {
-		fmt.Printf("helper=%s desc=%q\n", q.ID, q.Description)
+		rows = append(rows, []any{q.ID, q.Description})
 	}
+	t := governance.Table{Columns: []string{"id", "description"}, Rows: rows}
+	fmt.Println(formatTable(t))
+	fmt.Printf("(%d rows)\n", len(rows))
 }
 
-func printOutput(format string, out outputEnvelope) {
+func printQueryOutput(format string, out outputEnvelope) {
 	if format != "text" && format != "json" {
 		log.Fatalf("invalid -format %q (expected text or json)", format)
 	}
-
 	if format == "json" {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -175,47 +158,100 @@ func printOutput(format string, out outputEnvelope) {
 		return
 	}
 
-	res := out.Result
-	fmt.Printf("scan: files=%d subdir=%q max_files=%d scan_ms=%d\n", res.ScanFiles, res.Subdir, res.MaxFiles, res.ScanElapsed.Milliseconds())
-	fmt.Printf("build: action=%s reason=%q changed=%d parse_errors=%d parse_ms=%d load_ms=%d\n",
-		res.Sync.Action,
-		res.Sync.Reason,
-		res.Sync.Changed,
-		res.Sync.ParseErrors,
-		res.Sync.ParseElapsed.Milliseconds(),
-		res.Sync.LoadElapsed.Milliseconds(),
-	)
-	fmt.Printf("db: files=%d nodes=%d\n", res.Sync.FilesCount, res.Sync.NodesCount)
-
-	if len(out.Runs) > 0 {
-		fmt.Printf("sql runs=%d\n", len(out.Runs))
-		for _, run := range out.Runs {
-			fmt.Printf("run=%s rows=%d\n", run.Name, len(run.Rows))
-			for i, row := range run.Rows {
-				fmt.Printf("run=%s row[%d]=%v\n", run.Name, i+1, row)
-			}
-		}
-	}
+	fmt.Println(formatTable(out.Table))
+	fmt.Printf("(%d rows)\n", len(out.Table.Rows))
 }
 
-func parseIDs(args []string) []string {
-	out := make([]string, 0, len(args))
-	seen := make(map[string]struct{}, len(args))
-	for _, arg := range args {
-		parts := strings.Split(arg, ",")
-		for _, part := range parts {
-			id := strings.TrimSpace(part)
-			if id == "" {
-				continue
+func formatTable(t governance.Table) string {
+	if len(t.Columns) == 0 {
+		return "(no columns)"
+	}
+
+	const maxColWidth = 60
+	widths := make([]int, len(t.Columns))
+	for i, col := range t.Columns {
+		widths[i] = minInt(maxColWidth, utf8.RuneCountInString(col))
+	}
+
+	cellRows := make([][]string, len(t.Rows))
+	for r := range t.Rows {
+		cellRows[r] = make([]string, len(t.Columns))
+		for c := range t.Columns {
+			var cell any
+			if c < len(t.Rows[r]) {
+				cell = t.Rows[r][c]
 			}
-			if _, ok := seen[id]; ok {
-				continue
+			s := truncateCell(formatCell(cell), maxColWidth)
+			cellRows[r][c] = s
+			if w := utf8.RuneCountInString(s); w > widths[c] {
+				widths[c] = minInt(maxColWidth, w)
 			}
-			seen[id] = struct{}{}
-			out = append(out, id)
 		}
 	}
-	return out
+
+	var b strings.Builder
+	b.WriteString(renderSeparator(widths))
+	b.WriteString("\n")
+	b.WriteString(renderRow(t.Columns, widths))
+	b.WriteString("\n")
+	b.WriteString(renderSeparator(widths))
+	for _, row := range cellRows {
+		b.WriteString("\n")
+		b.WriteString(renderRow(row, widths))
+	}
+	b.WriteString("\n")
+	b.WriteString(renderSeparator(widths))
+	return b.String()
+}
+
+func renderSeparator(widths []int) string {
+	var b strings.Builder
+	b.WriteByte('+')
+	for _, w := range widths {
+		b.WriteString(strings.Repeat("-", w+2))
+		b.WriteByte('+')
+	}
+	return b.String()
+}
+
+func renderRow(values []string, widths []int) string {
+	var b strings.Builder
+	b.WriteByte('|')
+	for i, v := range values {
+		pad := widths[i] - utf8.RuneCountInString(v)
+		b.WriteByte(' ')
+		b.WriteString(v)
+		if pad > 0 {
+			b.WriteString(strings.Repeat(" ", pad))
+		}
+		b.WriteString(" |")
+	}
+	return b.String()
+}
+
+func formatCell(v any) string {
+	if v == nil {
+		return "NULL"
+	}
+	return fmt.Sprint(v)
+}
+
+func truncateCell(s string, maxWidth int) string {
+	if maxWidth <= 0 || utf8.RuneCountInString(s) <= maxWidth {
+		return s
+	}
+	runes := []rune(s)
+	if maxWidth <= 3 {
+		return string(runes[:maxWidth])
+	}
+	return string(runes[:maxWidth-3]) + "..."
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func resolveDuckDBPath(repoRoot, duckdbPath string) string {
@@ -229,15 +265,14 @@ func rootUsageText() string {
 	return strings.TrimSpace(`goastdb indexes Go AST into DuckDB and executes SQL.
 
 Usage:
-  goastdb query [flags] <sql> [<sql>...]
+  goastdb query [flags] <sql>
   goastdb helper [flags] list
-  goastdb helper [flags] <id[,id...]> [<id>...]
+  goastdb helper [flags] <id>
 
 Examples:
   goastdb query "SELECT COUNT(*) AS files FROM files"
-  goastdb query "SELECT COUNT(*) AS files FROM files" "SELECT COUNT(*) AS nodes FROM nodes"
   goastdb helper list
-  goastdb helper AST_KIND_DISTRIBUTION,FUNCTIONS_PER_FILE
+  goastdb helper LARGE_FUNCTIONS_BY_LINES
 
 Defaults:
   --repo defaults to current directory

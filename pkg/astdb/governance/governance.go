@@ -34,6 +34,11 @@ type Violation struct {
 
 type Row map[string]any
 
+type Table struct {
+	Columns []string `json:"columns"`
+	Rows    [][]any  `json:"rows,omitempty"`
+}
+
 type RunOptions struct {
 	RuleIDs []string
 }
@@ -254,6 +259,46 @@ func (r *Runner) AdhocQuery(ctx context.Context, query string, args ...any) ([]R
 		out = append(out, row)
 	}
 	return out, rows.Err()
+}
+
+func (r *Runner) QueryTable(ctx context.Context, query string, args ...any) (Table, error) {
+	db, err := sql.Open("duckdb", r.duckDBPath)
+	if err != nil {
+		return Table{}, err
+	}
+	defer func() { _ = db.Close() }()
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return Table{}, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return Table{}, err
+	}
+	out := Table{Columns: cols, Rows: make([][]any, 0)}
+
+	for rows.Next() {
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return Table{}, err
+		}
+		row := make([]any, len(cols))
+		for i := range cols {
+			row[i] = normalize(vals[i])
+		}
+		out.Rows = append(out.Rows, row)
+	}
+	if err := rows.Err(); err != nil {
+		return Table{}, err
+	}
+	return out, nil
 }
 
 func filterRules(rules []Rule, ids []string) []Rule {
